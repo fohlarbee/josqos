@@ -13,6 +13,7 @@ export function ThemedText({ style, type = 'default', themeColor, ...rest }: The
 
   return (
     <Text
+      maxFontSizeMultiplier={1.3}
       style={[
         { color: theme[themeColor ?? 'text'] },
         type === 'default' && styles.default,
