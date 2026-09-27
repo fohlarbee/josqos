@@ -64,6 +64,14 @@ Total: 37 automated tests (`npm test`), `npm run typecheck`.
 - **Build:** `eas init`, then `eas build -p android --profile preview` (produces an `.apk`). App ID `com.josqos.app`.
 - **Checks on a real phone:** the Network card's details line shows the raw readings; switch the phone between 4G-only and 5G-auto and confirm the detected technology changes; try a 3G-only setting to see the refusal.
 
+## Shipping fixes to an installed Android app (over the air)
+
+`expo-updates` is configured (channel `preview`, runtime version policy `appVersion`). Once an `.apk` built with it is installed:
+
+- **JS-only change** (screens, measurement engine, analysis): `eas update --channel preview --message "what changed"`. The phone downloads it on launch and applies it on the next launch. No build.
+- **Native change** (anything in `modules/josqos-radio/`, new native packages, `app.json` plugins): needs a new build **and** a bump of `version` in `app.json`, so an old binary never receives JS that expects newer native code.
+- Builds made before this setup (the first `.apk`) cannot receive updates.
+
 ## Known risks
 
 - Cloudflare's endpoints are public but not a contract for this use; volume here is tiny.

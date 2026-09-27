@@ -40,5 +40,6 @@ export async function simulateTest(
     jitterMs: m.jitter_ms,
     lossPct: m.packet_loss_pct,
     bytes: 0,
+    stageMs: { latency: STAGE_MS, download: STAGE_MS, upload: STAGE_MS },
   };
 }

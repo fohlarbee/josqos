@@ -1,6 +1,6 @@
-import { SERVER, TEST } from '@/constants/app';
+import { SERVER, TEST } from '../constants/app.ts';
 
-import { latencyStats, toMbps } from './calc';
+import { latencyStats, toMbps } from './calc.ts';
 
 export type Stage = 'latency' | 'download' | 'upload';
 
@@ -12,19 +12,35 @@ export type RunResult = {
   lossPct: number;
   /** Payload bytes moved by the download and upload transfers. */
   bytes: number;
+  /** How long each stage took, to show where a slow run spends its time. */
+  stageMs: Record<Stage, number>;
 };
 
-const nonce = () => Math.random().toString(36).slice(2);
+/** Values that become known before the run finishes, for the live display. */
+export type PartialResult = Partial<Pick<RunResult, 'latencyMs' | 'jitterMs' | 'lossPct' | 'downloadMbps' | 'uploadMbps'>>;
 
-/** Runs `task` with a signal that aborts on timeout or when the caller's signal aborts. */
+const nonce = () => Math.random().toString(36).slice(2);
+const reason = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
+/**
+ * Runs `task` with a signal that aborts on timeout or when the caller's signal aborts.
+ * A timeout is reported as "timed out after N s"; a caller abort is passed through unchanged.
+ */
 async function withTimeout<T>(ms: number, outer: AbortSignal, task: (s: AbortSignal) => Promise<T>): Promise<T> {
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), ms);
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    ctrl.abort();
+  }, ms);
   const forward = () => ctrl.abort();
   if (outer.aborted) ctrl.abort();
   else outer.addEventListener('abort', forward);
   try {
     return await task(ctrl.signal);
+  } catch (e) {
+    if (timedOut && !outer.aborted) throw new Error(`timed out after ${Math.round(ms / 1000)} s`);
+    throw e;
   } finally {
     clearTimeout(timer);
     outer.removeEventListener('abort', forward);
@@ -38,7 +54,7 @@ async function probe(signal: AbortSignal): Promise<number | null> {
       const t0 = performance.now();
       const res = await fetch(`${SERVER.down(0)}&r=${nonce()}`, { signal: s });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      await res.arrayBuffer();
+      await res.blob();
       return performance.now() - t0;
     });
   } catch (e) {
@@ -50,9 +66,16 @@ async function probe(signal: AbortSignal): Promise<number | null> {
 async function measureLatency(signal: AbortSignal) {
   await probe(signal); // warm-up: opens the connection, result discarded
   const rtts: (number | null)[] = [];
-  for (let i = 0; i < TEST.latencyProbes; i++) rtts.push(await probe(signal));
+  const started = Date.now();
+  for (let i = 0; i < TEST.latencyProbes; i++) {
+    if (rtts.length >= TEST.minLatencySamples) {
+      if (Date.now() - started > TEST.latencyBudgetMs) break; // slow link: enough samples
+      if (rtts.every((v) => v === null)) break; // nothing is answering: fail fast
+    }
+    rtts.push(await probe(signal));
+  }
   const stats = latencyStats(rtts);
-  if (Number.isNaN(stats.latencyMs)) throw new Error('No response from the test server. Check your connection.');
+  if (Number.isNaN(stats.latencyMs)) throw new Error('No response from the test server. Check the mobile data connection.');
   return stats;
 }
 
@@ -63,36 +86,54 @@ async function measureTransfer(kind: 'down' | 'up', signal: AbortSignal) {
   let bytes = 0;
   for (const size of sizes) {
     try {
-      const ms = await withTimeout(TEST.transferTimeoutMs, signal, async (s) => {
+      const { ms, moved } = await withTimeout(TEST.transferTimeoutMs, signal, async (s) => {
         const t0 = performance.now();
         const res =
           kind === 'down'
             ? await fetch(`${SERVER.down(size)}&r=${nonce()}`, { signal: s })
             : await fetch(SERVER.up, { method: 'POST', body: 'a'.repeat(size), signal: s });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        await res.arrayBuffer();
-        return performance.now() - t0;
+        // blob(), not arrayBuffer(): React Native keeps blobs native, while arrayBuffer() would
+        // copy every byte through a slow base64 step in JavaScript and inflate the timing.
+        const blob = await res.blob();
+        return { ms: performance.now() - t0, moved: kind === 'down' && blob.size > 0 ? blob.size : size };
       });
-      mbps = toMbps(size, ms);
-      bytes += size;
+      mbps = toMbps(moved, ms);
+      bytes += moved;
       if (ms >= TEST.escalateBelowMs) break;
     } catch (e) {
       if (signal.aborted) throw e;
-      if (mbps === null) throw new Error(`${kind === 'down' ? 'Download' : 'Upload'} test failed. Check your connection.`);
-      break; // a larger transfer timed out: keep the last completed measurement
+      if (mbps === null) throw new Error(`${kind === 'down' ? 'Download' : 'Upload'} failed: ${reason(e)}`);
+      break; // a larger transfer failed or timed out: keep the last completed measurement
     }
   }
   return { mbps: mbps as number, bytes };
 }
 
 /** One full run: latency/jitter/loss, then download, then upload. */
-export async function runTest(signal: AbortSignal, onStage: (s: Stage) => void): Promise<RunResult> {
-  onStage('latency');
-  const lat = await measureLatency(signal);
-  onStage('download');
-  const down = await measureTransfer('down', signal);
-  onStage('upload');
-  const up = await measureTransfer('up', signal);
+export async function runTest(
+  signal: AbortSignal,
+  onStage: (s: Stage) => void,
+  onPartial: (p: PartialResult) => void = () => {},
+): Promise<RunResult> {
+  const stageMs: Record<Stage, number> = { latency: 0, download: 0, upload: 0 };
+  const timed = async <T>(stage: Stage, task: () => Promise<T>): Promise<T> => {
+    onStage(stage);
+    const t0 = Date.now();
+    try {
+      return await task();
+    } finally {
+      stageMs[stage] = Date.now() - t0;
+    }
+  };
+
+  const lat = await timed('latency', () => measureLatency(signal));
+  onPartial({ latencyMs: lat.latencyMs, jitterMs: lat.jitterMs, lossPct: lat.lossPct });
+  const down = await timed('download', () => measureTransfer('down', signal));
+  onPartial({ downloadMbps: down.mbps });
+  const up = await timed('upload', () => measureTransfer('up', signal));
+  onPartial({ uploadMbps: up.mbps });
+
   return {
     downloadMbps: down.mbps,
     uploadMbps: up.mbps,
@@ -100,5 +141,6 @@ export async function runTest(signal: AbortSignal, onStage: (s: Stage) => void):
     jitterMs: lat.jitterMs,
     lossPct: lat.lossPct,
     bytes: down.bytes + up.bytes,
+    stageMs,
   };
 }

@@ -17,6 +17,9 @@ export const TEST = {
   /** Probes per run; a separate warm-up probe is sent first and discarded. */
   latencyProbes: 20,
   probeTimeoutMs: 3000,
+  /** Stop probing after this long once `minLatencySamples` are in, so a slow link cannot stretch a run. */
+  latencyBudgetMs: 8000,
+  minLatencySamples: 5,
   /** Sizes are tried in order; a bigger one is only used if the last finished within `escalateBelowMs`. */
   downloadSizes: [1_000_000, 10_000_000, 50_000_000],
   uploadSizes: [1_000_000, 5_000_000, 25_000_000],

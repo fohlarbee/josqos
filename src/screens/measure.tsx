@@ -11,7 +11,7 @@ import { ThemedText } from '@/components/themed-text';
 import { LOCATIONS, OPERATORS, TEST } from '@/constants/app';
 import { insertMeasurement, lastFieldMeasurement } from '@/db';
 import { periodOf } from '@/measure/calc';
-import { runTest, type RunResult, type Stage } from '@/measure/network-test';
+import { runTest, type PartialResult, type RunResult, type Stage } from '@/measure/network-test';
 import { getRadioInfo } from '@/measure/radio';
 import { simulateTest } from '@/measure/simulate';
 import { useTheme } from '@/hooks/use-theme';
@@ -34,21 +34,35 @@ function parseSignal(text: string): number | null | 'invalid' {
   return Number.isFinite(v) && v <= -20 && v >= -150 ? v : 'invalid';
 }
 
+/** Location is a nice-to-have: the permission prompt and the fix together get 8 s, then it is skipped. */
 async function currentPosition() {
-  try {
-    const perm = await Location.requestForegroundPermissionsAsync();
-    if (!perm.granted) return null;
-    const timeout = new Promise<null>((resolve) => setTimeout(() => resolve(null), 5000));
-    const fix = await Promise.race([
-      Location.getLastKnownPositionAsync().then(
-        (p) => p ?? Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced }),
-      ),
-      timeout,
-    ]);
-    return fix ? { latitude: fix.coords.latitude, longitude: fix.coords.longitude } : null;
-  } catch {
-    return null;
-  }
+  const attempt = (async () => {
+    try {
+      const perm = await Location.requestForegroundPermissionsAsync();
+      if (!perm.granted) return null;
+      const fix =
+        (await Location.getLastKnownPositionAsync()) ??
+        (await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced }));
+      return { latitude: fix.coords.latitude, longitude: fix.coords.longitude };
+    } catch {
+      return null;
+    }
+  })();
+  const giveUp = new Promise<null>((resolve) => setTimeout(() => resolve(null), 8000));
+  return Promise.race([attempt, giveUp]);
+}
+
+function liveText(p: PartialResult): string {
+  const parts: string[] = [];
+  if (p.latencyMs !== undefined) parts.push(`ping ${num(p.latencyMs, 0)} ms`, `jitter ${num(p.jitterMs, 1)} ms`, `loss ${num(p.lossPct, 0)}%`);
+  if (p.downloadMbps !== undefined) parts.push(`down ${num(p.downloadMbps)} Mbps`);
+  if (p.uploadMbps !== undefined) parts.push(`up ${num(p.uploadMbps)} Mbps`);
+  return parts.join(' · ');
+}
+
+function timingText(r: RunResult): string {
+  const sec = (ms: number) => `${(ms / 1000).toFixed(1)} s`;
+  return `latency ${sec(r.stageMs.latency)}, download ${sec(r.stageMs.download)}, upload ${sec(r.stageMs.upload)}`;
 }
 
 /** One line telling the researcher what the phone reports. */
@@ -77,7 +91,18 @@ export function Measure() {
   const [progress, setProgress] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [results, setResults] = useState<RunResult[]>([]);
+  const [live, setLive] = useState<PartialResult>({});
+  const [elapsed, setElapsed] = useState(0);
   const abort = useRef<AbortController | null>(null);
+
+  // A running clock, so a slow test never looks frozen.
+  useEffect(() => {
+    if (!running) return;
+    const started = Date.now();
+    setElapsed(0);
+    const id = setInterval(() => setElapsed(Math.floor((Date.now() - started) / 1000)), 1000);
+    return () => clearInterval(id);
+  }, [running]);
 
   useEffect(() => {
     const last = lastFieldMeasurement();
@@ -123,12 +148,14 @@ export function Measure() {
     abort.current = controller;
     setResults([]);
     setRunning(true);
-    setProgress(simulate ? 'Starting simulation…' : 'Getting location…');
-    const position = simulate ? null : await currentPosition();
+    setProgress('Starting…');
+    setLive({});
+    const positionPromise = simulate ? Promise.resolve(null) : currentPosition();
     const sessionId = String(Date.now());
 
     try {
       for (let i = 1; i <= runs; i++) {
+        setLive({});
         const onStage = (stage: Stage) => setProgress(`Run ${i} of ${runs}: ${STAGE_LABEL[stage]}…`);
         const when = new Date();
         const period = periodOf(when);
@@ -141,7 +168,8 @@ export function Measure() {
         }
         const r = simulate
           ? await simulateTest(controller.signal, onStage, technology, period, dbm)
-          : await runTest(controller.signal, onStage);
+          : await runTest(controller.signal, onStage, (p) => setLive((prev) => ({ ...prev, ...p })));
+        const position = await positionPromise;
         insertMeasurement({
           session_id: sessionId,
           created_at: when.toISOString(),
@@ -258,7 +286,17 @@ export function Measure() {
         <Button title={`${simulate ? 'Simulate' : 'Start'} ${runs} run${runs > 1 ? 's' : ''}`} onPress={start} />
       )}
 
-      {progress ? <ThemedText type="small">{progress}</ThemedText> : null}
+      {progress ? (
+        <ThemedText type="small">
+          {progress}
+          {running ? ` (${elapsed} s)` : ''}
+        </ThemedText>
+      ) : null}
+      {running && liveText(live) ? (
+        <ThemedText type="small" themeColor="textSecondary">
+          So far: {liveText(live)}
+        </ThemedText>
+      ) : null}
       {error ? (
         <ThemedText type="small" style={{ color: theme.danger }}>
           {error}
@@ -297,6 +335,11 @@ export function Measure() {
           <ThemedText type="small" themeColor="textSecondary">
             Down / Up in Mbps, Ping / Jitter in ms. {usedMb > 0 ? `Data used: ${num(usedMb, 0)} MB.` : 'Simulated: no data used.'}
           </ThemedText>
+          {usedMb > 0 ? (
+            <ThemedText type="small" themeColor="textSecondary">
+              Last run took {timingText(results[results.length - 1])}.
+            </ThemedText>
+          ) : null}
         </Card>
       )}
     </ScrollView>
